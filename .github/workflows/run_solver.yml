@@ -1,0 +1,225 @@
+name: PDP Solver - Run Experiments
+
+on:
+  workflow_dispatch:
+    inputs:
+      population_size:
+        description: 'Số cá thể GA (Population Size)'
+        required: true
+        default: '50'
+        type: string
+      max_generations:
+        description: 'Số thế hệ tối đa (Max Generations)'
+        required: true
+        default: '100'
+        type: string
+      mutation_rate:
+        description: 'Tỷ lệ đột biến (Mutation Rate, 0.0-1.0)'
+        required: true
+        default: '0.1'
+        type: string
+      ls_iterations:
+        description: 'Số vòng lặp Local Search'
+        required: true
+        default: '100'
+        type: string
+      instance_file:
+        description: 'File instance (e.g., U_50_1.0_Num_1_pd.txt)'
+        required: true
+        default: 'U_50_1.0_Num_1_pd.txt'
+        type: string
+      run_count:
+        description: 'Số lần chạy (để lấy trung bình)'
+        required: true
+        default: '1'
+        type: string
+
+jobs:
+  run-solver:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++ make bc
+    
+    - name: Update Local Search iterations and Compile
+      run: |
+        sed -i "s/IntegratedLocalSearch ils(data, [0-9]*)/IntegratedLocalSearch ils(data, ${{ inputs.ls_iterations }})/g" main_ga_tabu.cpp
+        g++ -O2 -std=c++17 -o pdp_solver \
+          main_ga_tabu.cpp \
+          pdp_reader.cpp \
+          pdp_utils.cpp \
+          pdp_ga.cpp \
+          pdp_tabu.cpp \
+          pdp_fitness.cpp \
+          pdp_localsearch.cpp \
+          pdp_init.cpp
+        echo "✅ Compiled with LS iterations = ${{ inputs.ls_iterations }}"
+    
+    - name: Run experiments
+      run: |
+        echo "=========================================="
+        echo "  PDP SOLVER EXPERIMENT"
+        echo "=========================================="
+        echo "Instance: ${{ inputs.instance_file }}"
+        echo "Population Size: ${{ inputs.population_size }}"
+        echo "Max Generations: ${{ inputs.max_generations }}"
+        echo "Mutation Rate: ${{ inputs.mutation_rate }}"
+        echo "LS Iterations: ${{ inputs.ls_iterations }}"
+        echo "Run Count: ${{ inputs.run_count }}"
+        echo "=========================================="
+        
+        mkdir -p results
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        RESULT_FILE="results/experiment_${TIMESTAMP}.csv"
+        
+        echo "Run,Instance,PopSize,MaxGen,MutRate,LSIter,CostBeforeLS,CostAfterLS,Improvement,ImprovementPct,Feasible,ResupplyEvents,Runtime_sec" > $RESULT_FILE
+        
+        for run in $(seq 1 ${{ inputs.run_count }}); do
+          echo ""
+          echo ">>> Run $run / ${{ inputs.run_count }}"
+          
+          START_TIME=$(date +%s.%N)
+          
+          OUTPUT=$(./pdp_solver \
+            "${{ inputs.instance_file }}" \
+            ${{ inputs.population_size }} \
+            ${{ inputs.max_generations }} \
+            ${{ inputs.mutation_rate }} \
+            $run 2>&1)
+          
+          END_TIME=$(date +%s.%N)
+          RUNTIME=$(echo "$END_TIME - $START_TIME" | bc)
+          
+          COST_BEFORE=$(echo "$OUTPUT" | grep "Cost before Local Search:" | awk '{print $5}')
+          COST_AFTER=$(echo "$OUTPUT" | grep "Cost after Local Search:" | awk '{print $5}')
+          IMPROVEMENT=$(echo "$OUTPUT" | grep "Improvement by LS:" | awk '{print $4}')
+          IMPROVEMENT_PCT=$(echo "$OUTPUT" | grep "Improvement by LS:" | grep -oP '\(\K[0-9.]+(?=%)' || echo "0")
+          FEASIBLE=$(echo "$OUTPUT" | grep "Feasible:" | awk '{print $2}')
+          RESUPPLY=$(echo "$OUTPUT" | grep "Resupply Events:" | awk '{print $3}')
+          
+          if [ -z "$IMPROVEMENT" ]; then
+            IMPROVEMENT="0"
+            IMPROVEMENT_PCT="0"
+          fi
+          
+          echo "$run,${{ inputs.instance_file }},${{ inputs.population_size }},${{ inputs.max_generations }},${{ inputs.mutation_rate }},${{ inputs.ls_iterations }},$COST_BEFORE,$COST_AFTER,$IMPROVEMENT,$IMPROVEMENT_PCT,$FEASIBLE,$RESUPPLY,$RUNTIME" >> $RESULT_FILE
+          
+          echo "  Cost: $COST_BEFORE -> $COST_AFTER (Improvement: $IMPROVEMENT_PCT%)"
+          echo "  Runtime: ${RUNTIME}s"
+        done
+        
+        echo ""
+        echo "=========================================="
+        echo "  RESULTS SAVED TO: $RESULT_FILE"
+        echo "=========================================="
+        cat $RESULT_FILE
+        
+        echo "RESULT_FILE=$RESULT_FILE" >> $GITHUB_ENV
+    
+    - name: Generate summary report
+      run: |
+        echo "# 📊 PDP Solver Experiment Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Instance | \`${{ inputs.instance_file }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Population Size | ${{ inputs.population_size }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Max Generations | ${{ inputs.max_generations }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Mutation Rate | ${{ inputs.mutation_rate }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| LS Iterations | ${{ inputs.ls_iterations }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Run Count | ${{ inputs.run_count }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Results" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        cat $RESULT_FILE >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ inputs.run_count }}" -gt 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Statistics" >> $GITHUB_STEP_SUMMARY
+          
+          AVG_COST=$(tail -n +2 $RESULT_FILE | awk -F',' '{sum+=$8; count++} END {printf "%.2f", sum/count}')
+          MIN_COST=$(tail -n +2 $RESULT_FILE | awk -F',' 'NR==1{min=$8} $8<min{min=$8} END {print min}')
+          MAX_COST=$(tail -n +2 $RESULT_FILE | awk -F',' 'NR==1{max=$8} $8>max{max=$8} END {print max}')
+          AVG_RUNTIME=$(tail -n +2 $RESULT_FILE | awk -F',' '{sum+=$13; count++} END {printf "%.2f", sum/count}')
+          
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Average Cost | $AVG_COST |" >> $GITHUB_STEP_SUMMARY
+          echo "| Min Cost | $MIN_COST |" >> $GITHUB_STEP_SUMMARY
+          echo "| Max Cost | $MAX_COST |" >> $GITHUB_STEP_SUMMARY
+          echo "| Average Runtime | ${AVG_RUNTIME}s |" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Upload results artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: experiment-results-${{ github.run_number }}
+        path: results/
+        retention-days: 30
+
+  generate-excel:
+    if: ${{ inputs.run_count > 1 }}
+    needs: run-solver
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download results
+      uses: actions/download-artifact@v4
+      with:
+        name: experiment-results-${{ github.run_number }}
+        path: results/
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: pip install pandas openpyxl
+    
+    - name: Generate Excel report
+      shell: python
+      run: |
+        import pandas as pd
+        import glob
+        
+        csv_files = glob.glob('results/*.csv')
+        if not csv_files:
+            print("No CSV files found")
+            exit(1)
+        
+        dfs = []
+        for f in csv_files:
+            df = pd.read_csv(f)
+            dfs.append(df)
+        
+        combined = pd.concat(dfs, ignore_index=True)
+        
+        excel_file = 'results/experiment_results.xlsx'
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            combined.to_excel(writer, sheet_name='Raw Data', index=False)
+            
+            if len(combined) > 1:
+                summary = combined.groupby('Instance').agg({
+                    'CostAfterLS': ['mean', 'min', 'max', 'std'],
+                    'ImprovementPct': ['mean', 'max'],
+                    'Runtime_sec': ['mean', 'sum']
+                }).round(2)
+                summary.columns = ['_'.join(col) for col in summary.columns]
+                summary.to_excel(writer, sheet_name='Summary')
+        
+        print(f"Excel report generated: {excel_file}")
+    
+    - name: Upload Excel report
+      uses: actions/upload-artifact@v4
+      with:
+        name: excel-report-${{ github.run_number }}
+        path: results/experiment_results.xlsx
+        retention-days: 30
